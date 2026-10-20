@@ -51,7 +51,19 @@ def valid_main(text):
 
 
 def valid_province(text):
-    return "table-title" in text and "</html>" in text.lower()
+    if "table-title" not in text or "</html>" not in text.lower():
+        return False
+    # Eğer sayfa "ilan bulunamadı" diyorsa JS henüz yüklememiş olabilir;
+    # Playwright fallback'i tetiklemek için False döndür.
+    # Ama bu kontrolü sadece count>0 olan iller için yaparız (main'de).
+    return True
+
+
+def valid_province_strict(text):
+    """count>0 olan iller için: 'ilan bulunamadı' varsa geçersiz say."""
+    if not valid_province(text):
+        return False
+    return "ilan bulunamad" not in text.lower()
 
 
 class Fetcher:
@@ -124,12 +136,18 @@ def parse_map(main_html):
     return [(slug, name, count) for slug, (name, count) in provinces.items()]
 
 
+NO_LISTING_RE = re.compile(r"ilan\s+bulunamad", re.I)
+
+
 def parse_province(page_html, il, slug):
     start = page_html.find("table-title")
     if start < 0:
-        return []
+        return None  # sayfa hiç gelmedi
     end = page_html.find("</table>", start)
     seg = page_html[start:end if end > 0 else None]
+    # "ilan bulunamadı" mesajı varsa boş liste döndür (hata değil)
+    if NO_LISTING_RE.search(seg):
+        return []
     page_link = URL + "?" + urlencode({"idId": slug, "il": il})
     rows = []
     for attrs, body in ROW_RE.findall(seg):
@@ -215,17 +233,22 @@ def main():
 
         for slug, name, count in targets:
             try:
-                page_html = f.get({"idId": slug, "il": name}, valid_province)
+                page_html = f.get({"idId": slug, "il": name}, valid_province_strict)
             except Exception as e:  # noqa: BLE001
                 print(f"  {name}: alınamadı ({e})", file=sys.stderr)
                 failed.append(name)
                 continue
             rows = parse_province(page_html, name, slug)
-            if len(rows) != count:
-                print(f"  {name}: haritada {count}, tabloda {len(rows)}", file=sys.stderr)
-            if not rows and count > 0:
+            if rows is None:
+                # sayfa geldi ama tablo bulunamadı — debug kaydet
+                print(f"  {name}: tablo bulunamadı, debug kaydediliyor", file=sys.stderr)
                 DEBUG_DIR.mkdir(exist_ok=True)
                 (DEBUG_DIR / f"{slug}.html").write_text(page_html, encoding="utf-8")
+                rows = []
+            elif len(rows) != count:
+                # harita ile sayfa uyuşmuyor (harita cache'den eski olabilir)
+                print(f"  {name}: haritada {count}, sayfada {len(rows)}"
+                      + (" (sayfada ilan yok)" if len(rows) == 0 else ""), file=sys.stderr)
             for r in rows:
                 items[r["key"]] = r
             time.sleep(0.4)
