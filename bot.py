@@ -1,13 +1,13 @@
 """İŞKUR kurum dışı kamu işçi alımı ilanlarını kontrol edip yeni ilanları Telegram'a bildirir.
 
 Çalışma mantığı:
-  1. Sayfayı gerçek bir tarayıcıyla (Playwright) açar, "Tüm İller" seçer.
-  2. Listedeki ilanları okur (sayfalama varsa tüm sayfaları gezer).
+  1. Sayfayı gerçek bir tarayıcıyla (Playwright) açar, harita (81 il) tamamen yüklenene kadar bekler.
+  2. İlanı olan her ili (haritadaki sayıya göre) tek tek seçer ve açılan ilanları okur.
   3. seen.json içindeki önceki ilanlarla karşılaştırır.
   4. Yeni ilanları Telegram'a yollar, seen.json'u günceller.
 
 İlk çalıştırmada mevcut ilanlar sadece kaydedilir, bildirim yağmuru olmaz.
-Liste hiç okunamazsa debug/ klasörüne sayfa kaydı bırakır ve hata ile çıkar.
+İlk çalıştırmada ya da hiç ilan okunamazsa debug/ klasörüne sayfa ve ağ kaydı bırakır.
 """
 
 import hashlib
@@ -24,11 +24,15 @@ URL = "https://www.iskur.gov.tr/ilanlar/kurumdisi-kamu-isci-alim-ilanlari/"
 STATE_FILE = Path("seen.json")
 DEBUG_DIR = Path("debug")
 MAX_SEEN = 5000
-MAX_PAGES = 30
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 DEBUG = os.environ.get("DEBUG") == "1"
+FIRST_RUN = not STATE_FILE.exists()
 
 # Menü, alt bilgi ve gezinti bağlantıları ilan sayılmasın.
 SKIP_PATH_PREFIXES = (
@@ -43,18 +47,34 @@ SKIP_EXACT_PATHS = {
 }
 SKIP_HOSTS = ("facebook.com", "instagram.com", "x.com", "youtube.com", "teknofest.app", "apple.com", "google.com", "goo.gl")
 
-SELECT_ALL_JS = """
-() => {
-  for (const s of document.querySelectorAll('select')) {
-    for (const o of s.options) {
-      if (o.text.trim().startsWith('Tüm İller')) {
-        s.value = o.value;
-        s.dispatchEvent(new Event('change', {bubbles: true}));
-        return true;
-      }
-    }
+PROVINCES_JS = """
+() => [...document.querySelectorAll('svg#svg-turkiye-haritasi g[data-iladi]')].map(g => ({
+  name: g.dataset.iladi,
+  count: parseInt(g.dataset.count || '0', 10) || 0
+}))
+"""
+
+SELECT_JS = """
+(name) => {
+  const s = document.querySelector('#city-dropdown');
+  if (!s) return false;
+  s.value = name;
+  s.dispatchEvent(new Event('change', {bubbles: true}));
+  if (window.jQuery) { try { window.jQuery(s).trigger('change'); } catch (e) {} }
+  return true;
+}
+"""
+
+CLICK_JS = """
+(name) => {
+  const g = [...document.querySelectorAll('svg#svg-turkiye-haritasi g[data-iladi]')]
+    .find(x => x.dataset.iladi === name);
+  if (!g) return false;
+  const t = g.querySelector('path') || g;
+  for (const type of ['mousedown', 'mouseup', 'click']) {
+    t.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true}));
   }
-  return false;
+  return true;
 }
 """
 
@@ -69,7 +89,7 @@ EXTRACT_JS = """
   });
   if (out.length) return out;
   document.querySelectorAll('a[href]').forEach(a => {
-    if (a.closest('nav, header, footer')) return;
+    if (a.closest('nav, header, footer, svg')) return;
     const t = clean(a.innerText);
     if (t) out.push({text: t, href: a.href, mode: 'link'});
   });
@@ -101,44 +121,115 @@ def key_of(item):
     return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 
-def dump_debug(page):
+def extract(page):
+    return [i for i in page.evaluate(EXTRACT_JS) if keep(i)]
+
+
+def dump_debug(page, net, tag=""):
     DEBUG_DIR.mkdir(exist_ok=True)
-    (DEBUG_DIR / "page.html").write_text(page.content(), encoding="utf-8")
-    page.screenshot(path=str(DEBUG_DIR / "page.png"), full_page=True)
+    (DEBUG_DIR / f"page{tag}.html").write_text(page.content(), encoding="utf-8")
+    page.screenshot(path=str(DEBUG_DIR / f"page{tag}.png"), full_page=True)
+    (DEBUG_DIR / "network.json").write_text(
+        json.dumps(net, ensure_ascii=False, indent=1), encoding="utf-8"
+    )
+
+
+def make_response_logger(net):
+    skip_types = ("image", "font", "css", "javascript")
+    skip_ext = (".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf")
+
+    def on_response(r):
+        try:
+            u = r.url
+            if "iskur.gov.tr" not in u or u.lower().split("?")[0].endswith(skip_ext):
+                return
+            ct = r.headers.get("content-type", "")
+            if any(x in ct for x in skip_types):
+                return
+            body = ""
+            if any(x in ct for x in ("json", "html", "text", "xml")):
+                try:
+                    body = r.text()[:400]
+                except Exception:
+                    pass
+            net.append({
+                "method": r.request.method,
+                "url": u,
+                "status": r.status,
+                "type": ct,
+                "post": (r.request.post_data or "")[:300],
+                "body": body,
+            })
+        except Exception:
+            pass
+
+    return on_response
+
+
+def load_page(page):
+    """Haritanın 81 ili da gelene kadar bekler (sayfa yarım kalırsa yeniden dener)."""
+    for attempt in range(1, 4):
+        try:
+            page.goto(URL, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_function(
+                "document.querySelectorAll('svg#svg-turkiye-haritasi g[data-iladi]').length >= 81",
+                timeout=60000,
+            )
+            try:
+                page.wait_for_load_state("load", timeout=30000)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            print(f"Yükleme denemesi {attempt} başarısız: {e}", file=sys.stderr)
+    return False
 
 
 def fetch_items():
+    net = []
+    collected = {}
+    expected = 0
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(locale="tr-TR", viewport={"width": 1366, "height": 900})
+        ctx = browser.new_context(locale="tr-TR", viewport={"width": 1366, "height": 900}, user_agent=UA)
         page = ctx.new_page()
         page.set_default_timeout(45000)
-        page.goto(URL, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(2000)
+        page.on("response", make_response_logger(net))
 
-        page.evaluate(SELECT_ALL_JS)
-        page.wait_for_timeout(3000)
+        ok = load_page(page)
+        provinces = page.evaluate(PROVINCES_JS) if ok else []
+        targets = [x for x in provinces if x["count"] > 0]
+        expected = sum(x["count"] for x in targets)
+        print(f"Sayfa yüklendi: {ok}, il sayısı: {len(provinces)}, ilanlı il: {len(targets)}, haritadaki ilan: {expected}")
 
-        items = []
-        for _ in range(MAX_PAGES):
-            items += page.evaluate(EXTRACT_JS)
-            nxt = page.query_selector(
-                ".paginate_button.next:not(.disabled), a[rel=next], li.next:not(.disabled) a"
-            )
-            if not nxt:
-                break
-            nxt.click()
-            page.wait_for_timeout(1500)
+        baseline = {key_of(i) for i in extract(page)} if ok else set()
+        sample_saved = False
 
-        items = [i for i in items if keep(i)]
-        if DEBUG or not items:
-            dump_debug(page)
+        for prov in targets:
+            name = prov["name"]
+            try:
+                page.evaluate(SELECT_JS, name)
+                page.wait_for_timeout(2000)
+                new = [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+                if not new:
+                    page.evaluate(CLICK_JS, name)
+                    page.wait_for_timeout(2000)
+                    new = [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+                for i in new:
+                    i["il"] = name
+                    collected[key_of(i)] = i
+                if not sample_saved:
+                    dump_debug(page, net, tag="_ilk_il")
+                    sample_saved = True
+                print(f"  {name}: haritada {prov['count']}, okunan yeni {len(new)}")
+            except Exception as e:
+                print(f"  {name}: hata {e}", file=sys.stderr)
+
+        if DEBUG or FIRST_RUN or not collected:
+            dump_debug(page, net)
         browser.close()
 
-    unique = {}
-    for i in items:
-        unique.setdefault(key_of(i), i)
-    return unique
+    return collected, expected
 
 
 def send(text):
@@ -154,7 +245,7 @@ def send_new(new_items):
     header = f"🆕 İŞKUR kurum dışı işçi alımı: {len(new_items)} yeni ilan\n\n"
     chunk = header
     for item in new_items:
-        line = item["text"][:600]
+        line = f"[{item.get('il', '?')}] " + item["text"][:600]
         if item["href"]:
             line += f"\n{item['href']}"
         line += "\n\n"
@@ -167,19 +258,21 @@ def send_new(new_items):
 
 
 def main():
-    items = fetch_items()
+    items, expected = fetch_items()
     if not items:
-        print("Hiç ilan okunamadı; debug/ klasörüne sayfa kaydedildi.", file=sys.stderr)
+        print("Hiç ilan okunamadı; debug/ klasörüne sayfa ve ağ kaydı bırakıldı.", file=sys.stderr)
         sys.exit(1)
 
-    first_run = not STATE_FILE.exists()
-    seen = json.loads(STATE_FILE.read_text("utf-8")) if not first_run else []
+    seen = json.loads(STATE_FILE.read_text("utf-8")) if not FIRST_RUN else []
     seen_set = set(seen)
     new = [v for k, v in items.items() if k not in seen_set]
-    print(f"Okunan: {len(items)}, yeni: {len(new)}, ilk çalıştırma: {first_run}")
+    print(f"Okunan: {len(items)}, haritadaki: {expected}, yeni: {len(new)}, ilk çalıştırma: {FIRST_RUN}")
 
-    if first_run:
-        send(f"✅ İlan botu kuruldu. Şu an listede {len(items)} ilan var, bunlar kaydedildi. Bundan sonra sadece yeni eklenenleri yollayacağım.")
+    if FIRST_RUN:
+        msg = f"✅ İlan botu kuruldu. Haritada {expected} ilan görünüyor, {len(items)} tanesini okuyabildim ve kaydettim."
+        if expected and len(items) < expected * 0.7:
+            msg += " Okuduğum sayı haritadakinden belirgin şekilde az, okuma ayarını düzeltmem gerekebilir."
+        send(msg + " Bundan sonra sadece yeni eklenenleri yollayacağım.")
     elif new:
         send_new(new)
 
