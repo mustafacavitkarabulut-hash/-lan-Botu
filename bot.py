@@ -185,6 +185,24 @@ def load_page(page):
     return False
 
 
+def wait_for_new(page, baseline, collected, timeout_ms=15000):
+    """İl seçildikten sonra yeni ilanlar görünene kadar bekler (yavaş açılan liste için).
+
+    Önceki ilin ilanları ekranda kalırsa onlar 'yeni' sayılmaz; sadece bu ile ait
+    yeni satırlar görününce biter. Listenin geri kalanı da yüklensin diye bir kez
+    daha bekleyip tekrar okur.
+    """
+    waited = 0
+    while waited < timeout_ms:
+        page.wait_for_timeout(500)
+        waited += 500
+        new = [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+        if new:
+            page.wait_for_timeout(1500)
+            return [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+    return []
+
+
 def fetch_items():
     net = []
     collected = {}
@@ -209,12 +227,10 @@ def fetch_items():
             name = prov["name"]
             try:
                 page.evaluate(SELECT_JS, name)
-                page.wait_for_timeout(2000)
-                new = [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+                new = wait_for_new(page, baseline, collected)
                 if not new:
                     page.evaluate(CLICK_JS, name)
-                    page.wait_for_timeout(2000)
-                    new = [i for i in extract(page) if key_of(i) not in baseline and key_of(i) not in collected]
+                    new = wait_for_new(page, baseline, collected)
                 for i in new:
                     i["il"] = name
                     collected[key_of(i)] = i
