@@ -77,19 +77,15 @@ class Fetcher:
         self._pw = self._browser = self._page = None
 
     def get(self, params, valid):
-        err = None
-        for attempt in range(1, 4):
-            try:
-                r = self.s.get(URL, params=params, timeout=(10, 60))
-                r.raise_for_status()
-                if valid(r.text):
-                    return r.text
-                err = "sayfa eksik geldi"
-            except Exception as e:  # noqa: BLE001
-                err = e
-            print(f"  HTTP denemesi {attempt} başarısız: {err}", file=sys.stderr)
-            time.sleep(2 * attempt)
-        print("  Düz HTTP olmadı, tarayıcıya geçiliyor.", file=sys.stderr)
+        # Önce bir kez HTTP dene; olmadı mı hemen tarayıcıya geç.
+        try:
+            r = self.s.get(URL, params=params, timeout=(10, 60))
+            r.raise_for_status()
+            if valid(r.text):
+                return r.text
+            print(f"  HTTP geçersiz sayfa döndürdü, tarayıcıya geçiliyor.", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"  HTTP hatası ({e}), tarayıcıya geçiliyor.", file=sys.stderr)
         return self._browser_get(params, valid)
 
     def _browser_get(self, params, valid):
