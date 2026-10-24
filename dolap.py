@@ -32,8 +32,7 @@ UA = (
 # Token verilmezse İŞKUR botunun token'ı kullanılır (aynı bot, farklı sohbet).
 TOKEN = os.environ.get("DOLAP_TELEGRAM_TOKEN") or os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ.get("DOLAP_TELEGRAM_CHAT_ID", "").strip()
-if not CHAT_ID:
-    sys.exit("DOLAP_TELEGRAM_CHAT_ID secret'ı tanımlı değil; Dolap bildirimleri için ayrı sohbet ID'si lazım.")
+GROUP_TITLE = os.environ.get("DOLAP_GROUP_TITLE", "Dolap").strip()
 
 PRICE_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?\s*(?:TL|₺)", re.I)
 # Telefon aramasında çıkan aksesuarları ele
@@ -126,16 +125,36 @@ def send(text):
 
 
 def load_state():
+    """(keys, chat_id) döndürür; dosya yoksa (None, "")."""
     if not STATE_FILE.exists():
-        return None
+        return None, ""
     try:
-        return list(json.loads(STATE_FILE.read_text("utf-8")).get("keys", []))
+        d = json.loads(STATE_FILE.read_text("utf-8"))
+        keys = d.get("keys")
+        return (list(keys) if keys is not None else None), str(d.get("chat_id", "") or "")
     except Exception:  # noqa: BLE001
-        return None
+        return None, ""
 
 
-def save_state(keys):
-    STATE_FILE.write_text(json.dumps({"keys": keys[-MAX_SEEN:]}, ensure_ascii=False), "utf-8")
+def save_state(keys, chat_id):
+    STATE_FILE.write_text(
+        json.dumps({"keys": None if keys is None else keys[-MAX_SEEN:], "chat_id": chat_id},
+                   ensure_ascii=False), "utf-8"
+    )
+
+
+def find_group_id():
+    """Botun eklendiği, adı GROUP_TITLE olan grubun numarasını Telegram'dan bulur."""
+    r = requests.get(f"https://api.telegram.org/bot{TOKEN}/getUpdates", timeout=30)
+    r.raise_for_status()
+    found = None
+    for upd in r.json().get("result", []):
+        for key in ("message", "my_chat_member", "channel_post", "edited_message"):
+            chat = (upd.get(key) or {}).get("chat")
+            if chat and chat.get("type") in ("group", "supergroup", "channel") \
+                    and (chat.get("title") or "").strip().lower() == GROUP_TITLE.lower():
+                found = str(chat["id"])  # en son güncellemedeki (grup süper gruba dönüşmüş olabilir)
+    return found
 
 
 def wanted(it):
@@ -148,6 +167,24 @@ def wanted(it):
 
 
 def main():
+    global CHAT_ID
+    seen, saved_chat = load_state()
+
+    # 1) Mesajın gideceği grubu belirle: secret > kayıtlı numara > adı "Dolap" olan grubu bul
+    if not CHAT_ID:
+        CHAT_ID = saved_chat
+    if not CHAT_ID:
+        CHAT_ID = find_group_id() or ""
+        if not CHAT_ID:
+            sys.exit(
+                f"'{GROUP_TITLE}' adlı grup bulunamadı. Botun gruba ekli olduğundan emin ol, "
+                f"grupta bir mesaj yaz ve botu tekrar çalıştır."
+            )
+        send(f"🔗 Bu grup Dolap botuna bağlandı. İlan kontrolü başlıyor.")
+        save_state(seen, CHAT_ID)  # numarayı hemen kaydet (Dolap kısmı hata verse bile)
+        print(f"Grup bulundu ve kaydedildi: {CHAT_ID}")
+
+    # 2) Dolap'taki ilanları oku
     items = fetch_items()
     print(f"Sayfada ürün: {len(items)}")
     if not items:
@@ -157,7 +194,6 @@ def main():
     matching = {k: v for k, v in items.items() if wanted(v)}
     print(f"Fiyat/filtre uyan: {len(matching)}")
 
-    seen = load_state()
     seen_set = set(seen or [])
     new = [v for k, v in matching.items() if k not in seen_set]
 
@@ -173,7 +209,7 @@ def main():
             send(f"📱 Yeni Dolap ilanı: {it['price']} TL\n{it['title']}\n{it['link']}")
             time.sleep(0.5)
 
-    save_state(seen + [k for k in matching if k not in seen_set])
+    save_state(seen + [k for k in matching if k not in seen_set], CHAT_ID)
     print(f"Yeni: {len(new)}")
 
 
