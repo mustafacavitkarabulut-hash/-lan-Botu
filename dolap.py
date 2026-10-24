@@ -28,8 +28,12 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+# Dolap bildirimleri İŞKUR botundan AYRI bir sohbete gider.
+# Token verilmezse İŞKUR botunun token'ı kullanılır (aynı bot, farklı sohbet).
+TOKEN = os.environ.get("DOLAP_TELEGRAM_TOKEN") or os.environ["TELEGRAM_TOKEN"]
+CHAT_ID = os.environ.get("DOLAP_TELEGRAM_CHAT_ID", "").strip()
+if not CHAT_ID:
+    sys.exit("DOLAP_TELEGRAM_CHAT_ID secret'ı tanımlı değil; Dolap bildirimleri için ayrı sohbet ID'si lazım.")
 
 PRICE_RE = re.compile(r"(\d{1,3}(?:\.\d{3})*|\d+)(?:,\d+)?\s*(?:TL|₺)", re.I)
 # Telefon aramasında çıkan aksesuarları ele
