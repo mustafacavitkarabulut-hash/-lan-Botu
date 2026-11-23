@@ -2,7 +2,7 @@ name: ilan-botu
 
 on:
   schedule:
-    - cron: "0 * * * *"   # her saat başı (UTC; saat başı olduğu için Türkiye'de de saat başı)
+    - cron: "17 * * * *"   # her saatin 17. dakikası (tam saat başı GitHub'da çok yoğun, işler gecikiyor/atlanıyor)
   workflow_dispatch:       # elle çalıştırmak için
 
 permissions:

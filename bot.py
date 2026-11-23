@@ -161,12 +161,28 @@ def parse_province(page_html, il, slug):
 # ---------------------------------------------------------------- Telegram
 
 def send(text):
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
-        timeout=30,
-    )
-    r.raise_for_status()
+    """Telegram'a mesaj yollar. Geçici hata (zaman aşımı, yoğunluk) olursa 5 kez dener."""
+    last_err = None
+    for attempt in range(1, 6):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
+                timeout=30,
+            )
+            if r.status_code == 429:  # çok sık istek: Telegram'ın istediği kadar bekle
+                wait = r.json().get("parameters", {}).get("retry_after", 5)
+                print(f"  Telegram 429, {wait} sn bekleniyor", file=sys.stderr)
+                time.sleep(min(int(wait) + 1, 60))
+                last_err = RuntimeError("Telegram 429")
+                continue
+            r.raise_for_status()
+            return
+        except requests.RequestException as e:
+            last_err = e
+            print(f"  Telegram denemesi {attempt} başarısız: {e}", file=sys.stderr)
+            time.sleep(3 * attempt)
+    raise last_err
 
 
 def send_new(new_items):
